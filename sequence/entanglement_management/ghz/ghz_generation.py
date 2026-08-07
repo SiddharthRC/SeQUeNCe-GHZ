@@ -5,14 +5,17 @@ Implements the hybrid GHZ-BSM routing protocol from Chen et al., arXiv:2604.0315
 
 Three phases on a central helper node (GHZNode):
     1. Bell state generation with each neighbor via GHZEntanglementGenerationA.
-    2. GHZ fusion: CX from a control qubit into each remaining qubit, then H,
-       converting k local Bell-pair qubits into a k-qubit GHZ state.
-    3. BSM on each (GHZ qubit, neighbor qubit) pair, with Pauli corrections sent
-       to each neighbor.
+    2. GHZ fusion (deterministic): CX from a control qubit into each remaining
+       qubit, then H, converting k local Bell-pair qubits into a k-qubit GHZ state.
+    3. BSM on each (GHZ qubit, neighbor qubit) pair, each succeeding with a single
+       probability q, with Pauli corrections sent to each neighbor.
 
-Degree k is capped at MAX_DEGREE=5 based on the exponential-decay success model
-q^(k-1). Idle T1/T2 decoherence is applied before fusion. Development uses a
-4-node star loaded via RouterNetTopo with meet_in_the_middle connections.
+In the hybrid GHZ-BSM protocol (Chen et al., Sec.~3), GHZ generation is
+deterministic local preparation and the probabilistic success q is applied at the
+BSM step, not as the q^(k-1) exponential-decay term (confirmed by Dr. Chung, Aug
+2026). Degree k is capped at MAX_DEGREE=5. Idle T1/T2 decoherence is applied before
+fusion. Development uses a 4-node star loaded via RouterNetTopo with
+meet_in_the_middle connections.
 """
 
 from __future__ import annotations
@@ -140,16 +143,18 @@ class GHZGenerationA(Protocol):
         owner (GHZNode): node this protocol is attached to.
         name (str): unique protocol instance name.
         neighbor_names (list[str]): neighbor node names, length <= MAX_DEGREE.
-        success_base (float): base q for success probability q^(k-1).
+        success_base (float): single-BSM success probability q, applied per
+            neighbor BSM in the hybrid protocol.
         t1_sec (float): T1 decoherence time in seconds.
         t2_sec (float): T2 decoherence time in seconds.
         _ready_neighbors (set[str]): neighbors whose Bell pairs are ready.
         _neighbor_keys (dict[str, int]): neighbor name to its memory qstate_key.
         _local_keys (dict[str, int]): neighbor name to helper's local qstate_key.
         _cycle_count (int): completed or attempted cycles, for logging.
-        detector_efficiency (float): per-detector click probability, 0.95 per
-            Chung. Stored but not yet used in the success model; how
-            it should combine with q^(k-1) is an open question.
+        detector_efficiency (float): photon detector efficiency, 0.95 per Chung.
+            Belongs at the heralded generation layer as a photon-loss factor, not
+            in the BSM success q (confirmed by Dr. Chung, Aug 2026). Stored here;
+            wired into generation once the herald-based path is implemented.
 
     On failure semantics: fusion failure is a single whole-measurement pass/fail
     draw, not per-qubit independent success. Confirmed by Xinan (2026-07) and
@@ -168,7 +173,7 @@ class GHZGenerationA(Protocol):
             owner (GHZNode): helper node this protocol runs on.
             name (str): unique name for this protocol instance.
             neighbor_names (list[str]): neighbor names, truncated to MAX_DEGREE.
-            success_base (float): base q for q^(k-1) (default 0.9).
+            success_base (float): single-BSM success probability q (default 0.9).
             t1_sec (float): T1 in seconds (default: perfect hardware preset).
             t2_sec (float): T2 in seconds, must satisfy 0 < t2 <= 2*t1.
             detector_efficiency (float): per-detector click probability (0.95).
@@ -280,11 +285,13 @@ class GHZGenerationA(Protocol):
         return self.owner.generator.random()
 
     def _run_ghz_fusion(self) -> None:
-        """Run the probabilistic success check, decoherence, then the fusion circuit.
+        """Apply decoherence, then run the fusion circuit (deterministic).
 
         The circuit is CX from qubit 0 into each qubit 1..k-1, then H on qubit 0.
-        Success probability is success_base^(k-1) per Chen et al.; on failure,
-        _broadcast_failure is called without running the circuit.
+        In the hybrid GHZ-BSM protocol (Chen et al., arXiv:2604.03155, Sec.~3),
+        GHZ state generation is deterministic local preparation inside the helper
+        node; the probabilistic success q is applied per BSM in _run_bsm_phase,
+        not here (confirmed by Dr. Chung, Aug 2026).
         """
         try:
             qm = self._get_stabilizer_manager()
@@ -295,16 +302,6 @@ class GHZGenerationA(Protocol):
 
         ordered = list(self.neighbor_names)
         local_keys = [self._local_keys[n] for n in ordered]
-        k = len(local_keys)
-
-        success_prob = self.success_base ** (k - 1)
-        if self._random() >= success_prob:
-            log.logger.info(
-                f"{self.name}: GHZ fusion failed probabilistic check "
-                f"(k={k}, q^(k-1)={success_prob:.4f}). Broadcasting failure."
-            )
-            self._broadcast_failure()
-            return
 
         try:
             qm.apply_idling_decoherence(
@@ -332,8 +329,16 @@ class GHZGenerationA(Protocol):
     def _run_bsm_phase(self, ordered_neighbors: list[str], local_keys: list[int]) -> None:
         """Run BSM on each (GHZ qubit, neighbor qubit) pair and send corrections.
 
-        Per neighbor: CX(local->neighbor), H(local), M(local), M(neighbor).
-        Outcomes (m0, m1) give the Z and X corrections sent via GHZ_RESULT.
+        Per neighbor: a single-q probabilistic success check, then CX(local->
+        neighbor), H(local), M(local), M(neighbor). Outcomes (m0, m1) give the Z
+        and X corrections sent via GHZ_RESULT.
+
+        Per the hybrid GHZ-BSM protocol (Chen et al., arXiv:2604.03155, Sec.~3),
+        each helper BSM succeeds with a single probability q (success_base), not
+        the q^(k-1) exponential-decay term (confirmed by Dr. Chung, Aug 2026).
+        A failed BSM fails the whole cycle via _broadcast_failure; treating one
+        neighbor's failure as a whole-cycle failure is a simplifying assumption
+        for this first implementation rather than a per-link partial success.
 
         Args:
             ordered_neighbors (list[str]): neighbor names, same order as local_keys.
@@ -355,6 +360,14 @@ class GHZGenerationA(Protocol):
         for i, neighbor in enumerate(ordered_neighbors):
             local_key = local_keys[i]
             neighbor_key = self._neighbor_keys[neighbor]
+
+            if self._random() >= self.success_base:
+                log.logger.info(
+                    f"{self.name}: BSM failed probabilistic check for {neighbor} "
+                    f"(q={self.success_base:.4f}). Broadcasting failure."
+                )
+                self._broadcast_failure()
+                return
 
             try:
                 results = qm.run_circuit(
@@ -428,7 +441,7 @@ class GHZNode(QuantumRouter):
             tl (Timeline): simulation timeline.
             neighbor_names (list[str]): neighbor names, truncated to MAX_DEGREE.
             seed (int | None): seed for the node's random number generator.
-            success_base (float): base q for q^(k-1) (default 0.9).
+            success_base (float): single-BSM success probability q (default 0.9).
             t1_sec (float): T1 in seconds (default: perfect hardware preset).
             t2_sec (float): T2 in seconds (default: same preset).
             detector_efficiency (float): per-detector click probability (0.95).

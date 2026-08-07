@@ -7,7 +7,7 @@ One test class per logical unit, similar to the existing SeQUeNCe test suite:
     TestDegreeCap               MAX_DEGREE enforcement.
     TestFusionCircuit           fusion circuit at the stabilizer level.
     TestNoiseAndDecoherence     noise injection and T1/T2 decoherence.
-    TestSuccessProbability      the q^(k-1) success check in _run_ghz_fusion.
+    TestSuccessProbability      the per-BSM single-q success check in _run_bsm_phase.
     TestNotifyBellReady         notify_bell_ready accumulation and fusion trigger.
     TestEndToEnd                full cycle via RouterNetTopo and install_ghz_eg_rules.
     TestGHZMessage              GHZMessage payload construction.
@@ -327,79 +327,103 @@ class TestNoiseAndDecoherence:
 
 
 class TestSuccessProbability:
-    """Tests for the q^(k-1) success check in _run_ghz_fusion."""
+    """Tests for the per-BSM single-q success check in _run_bsm_phase.
 
-    def _setup_node_ready_for_fusion(
+    In the hybrid GHZ-BSM protocol, GHZ fusion is deterministic and each helper
+    BSM succeeds with a single probability q (success_base), applied per neighbor
+    in _run_bsm_phase. A failed BSM fails the whole cycle. These tests drive
+    _run_bsm_phase directly (with local/neighbor keys already prepared) so the
+    only _random() draws are the BSM success checks, not anything in fusion.
+    """
+
+    def _setup_node_ready_for_bsm(
         self, neighbors: list[str], success_base: float = 0.9
-    ) -> tuple["GHZNode", MagicMock]:
-        # Return a (node, send_mock) pair with state set as if all Bell pairs are ready.
+    ) -> tuple["GHZNode", MagicMock, list[int]]:
+        # Return (node, send_mock, local_keys) with per-cycle state prepared and
+        # real stabilizer keys allocated for each (local, neighbor) BSM pair.
         tl = _make_timeline()
         node = _make_ghz_node("helper", tl, neighbors, success_base=success_base)
         send_mock: MagicMock = MagicMock()
         node.send_message = send_mock  # type: ignore[method-assign]
         tl.init()
         node.ghz_protocol._cycle_count = 1
-        node.ghz_protocol._local_keys = {n: i for i, n in enumerate(node.neighbor_names)}
-        node.ghz_protocol._neighbor_keys = {n: 100 + i for i, n in enumerate(node.neighbor_names)}
+
+        qm = tl.quantum_manager
+        local_keys = []
+        neighbor_keys = {}
+        for n in node.neighbor_names:
+            lk = qm.new()
+            nk = qm.new()
+            local_keys.append(lk)
+            neighbor_keys[n] = nk
+        node.ghz_protocol._local_keys = dict(zip(node.neighbor_names, local_keys))
+        node.ghz_protocol._neighbor_keys = neighbor_keys
         node.ghz_protocol._ready_neighbors = set(node.neighbor_names)
-        return node, send_mock
+        return node, send_mock, local_keys
 
-    def test_always_passes_for_k1(self):
-        # For k=1, q^0 = 1.0, so the check never fails.
-        node, send_mock = self._setup_node_ready_for_fusion(["n1"], success_base=0.0)
-        with patch.object(node.ghz_protocol, "_random", return_value=0.9999) as mock_random:
-            node.ghz_protocol._run_ghz_fusion()
-        assert mock_random.call_count == 1
-
-    def test_fails_when_random_exceeds_threshold(self):
-        # Failure should broadcast when random() >= success_base^(k-1).
-        neighbors = ["n1", "n2", "n3"]
-        node, send_mock = self._setup_node_ready_for_fusion(neighbors, success_base=0.9)
-        with patch.object(node.ghz_protocol, "_random", return_value=0.99) as mock_random:
-            node.ghz_protocol._run_ghz_fusion()
+    def test_single_neighbor_success_sends_result(self):
+        # A passing BSM draw should send a GHZ_RESULT, not a failure.
+        node, send_mock, local_keys = self._setup_node_ready_for_bsm(["n1"], success_base=0.9)
+        with patch.object(node.ghz_protocol, "_random", return_value=0.10):
+            node.ghz_protocol._run_bsm_phase(["n1"], local_keys)
         sent_types = [c.args[1].msg_type for c in send_mock.call_args_list]
-        assert all(t == GHZMsgType.GENERATION_FAILED for t in sent_types)
-        assert len(sent_types) == len(neighbors)
+        assert GHZMsgType.GHZ_RESULT in sent_types
+        assert GHZMsgType.GENERATION_FAILED not in sent_types
 
-    def test_passes_when_random_below_threshold(self):
-        # The check should not fail when random() < success_base^(k-1).
-        neighbors = ["n1", "n2", "n3"]
-        node, send_mock = self._setup_node_ready_for_fusion(neighbors, success_base=0.9)
-        with patch.object(node.ghz_protocol, "_random", return_value=0.10) as mock_random:
-            node.ghz_protocol._run_ghz_fusion()
-
-    def test_zero_success_base_always_fails_for_k_gt_1(self):
-        # success_base=0.0 gives q^(k-1)=0 for k>1, so fusion always fails.
-        neighbors = ["n1", "n2"]
-        node, send_mock = self._setup_node_ready_for_fusion(neighbors, success_base=0.0)
-        with patch.object(node.ghz_protocol, "_random", return_value=0.0) as mock_random:
-            node.ghz_protocol._run_ghz_fusion()
+    def test_failed_bsm_broadcasts_failure(self):
+        # A failing BSM draw (random >= q) should broadcast GENERATION_FAILED.
+        node, send_mock, local_keys = self._setup_node_ready_for_bsm(["n1", "n2"], success_base=0.9)
+        with patch.object(node.ghz_protocol, "_random", return_value=0.99):
+            node.ghz_protocol._run_bsm_phase(["n1", "n2"], local_keys)
         sent_types = [c.args[1].msg_type for c in send_mock.call_args_list]
         assert GHZMsgType.GENERATION_FAILED in sent_types
 
-    def test_unit_success_base_never_fails_check(self):
-        # success_base=1.0 gives q^(k-1)=1.0 for any k, so the check never fires.
-        neighbors = ["n1", "n2", "n3", "n4", "n5"]
-        node, send_mock = self._setup_node_ready_for_fusion(neighbors, success_base=1.0)
-        with patch.object(node.ghz_protocol, "_random", return_value=0.9999) as mock_random:
-            node.ghz_protocol._run_ghz_fusion()
+    def test_first_bsm_failure_fails_whole_cycle(self):
+        # If the first neighbor's BSM fails, the cycle fails immediately and no
+        # further neighbors are processed (whole-cycle failure assumption).
+        node, send_mock, local_keys = self._setup_node_ready_for_bsm(
+            ["n1", "n2", "n3"], success_base=0.9
+        )
+        with patch.object(node.ghz_protocol, "_random", return_value=0.99) as mock_random:
+            node.ghz_protocol._run_bsm_phase(["n1", "n2", "n3"], local_keys)
+        # Only the first neighbor's check runs before broadcast+return.
         assert mock_random.call_count == 1
+        sent_types = [c.args[1].msg_type for c in send_mock.call_args_list]
+        assert all(t == GHZMsgType.GENERATION_FAILED for t in sent_types)
 
-    def test_threshold_scales_with_k(self):
-        # The failure rate should increase with k under the exponential-decay model.
-        for k_neighbors in [["n1"], ["n1", "n2"]]:
-            node, send_mock = self._setup_node_ready_for_fusion(k_neighbors, success_base=0.9)
-            k = len(k_neighbors)
-            threshold = 0.9 ** (k - 1)
-            draw = 0.95
-            with patch.object(node.ghz_protocol, "_random", return_value=draw) as mock_random:
-                node.ghz_protocol._run_ghz_fusion()
-            if draw >= threshold:
-                sent_types = [c.args[1].msg_type for c in send_mock.call_args_list]
-                assert GHZMsgType.GENERATION_FAILED in sent_types
-                assert mock_random.call_count == 1
-            else:
-                assert mock_random.call_count == 1
+    def test_zero_success_base_always_fails(self):
+        # success_base=0.0 means random() >= 0.0 always holds, so BSM always fails.
+        node, send_mock, local_keys = self._setup_node_ready_for_bsm(["n1"], success_base=0.0)
+        with patch.object(node.ghz_protocol, "_random", return_value=0.0):
+            node.ghz_protocol._run_bsm_phase(["n1"], local_keys)
+        sent_types = [c.args[1].msg_type for c in send_mock.call_args_list]
+        assert GHZMsgType.GENERATION_FAILED in sent_types
+        assert GHZMsgType.GHZ_RESULT not in sent_types
+
+    def test_unit_success_base_never_fails(self):
+        # success_base=1.0 means random() (in [0,1)) is always < q, so no BSM
+        # fails the check; every neighbor should get a GHZ_RESULT.
+        neighbors = ["n1", "n2", "n3"]
+        node, send_mock, local_keys = self._setup_node_ready_for_bsm(neighbors, success_base=1.0)
+        with patch.object(node.ghz_protocol, "_random", return_value=0.9999):
+            node.ghz_protocol._run_bsm_phase(neighbors, local_keys)
+        sent_types = [c.args[1].msg_type for c in send_mock.call_args_list]
+        assert sent_types.count(GHZMsgType.GHZ_RESULT) == len(neighbors)
+        assert GHZMsgType.GENERATION_FAILED not in sent_types
+
+    def test_q_is_flat_not_exponential_in_k(self):
+        # The per-BSM check uses a flat q, independent of k: the same draw just
+        # below q passes for any number of neighbors (unlike the old q^(k-1)).
+        draw = 0.85  # < 0.9, so each individual BSM check passes
+        for neighbors in [["n1"], ["n1", "n2"], ["n1", "n2", "n3"]]:
+            node, send_mock, local_keys = self._setup_node_ready_for_bsm(
+                neighbors, success_base=0.9
+            )
+            with patch.object(node.ghz_protocol, "_random", return_value=draw):
+                node.ghz_protocol._run_bsm_phase(neighbors, local_keys)
+            sent_types = [c.args[1].msg_type for c in send_mock.call_args_list]
+            assert sent_types.count(GHZMsgType.GHZ_RESULT) == len(neighbors)
+            assert GHZMsgType.GENERATION_FAILED not in sent_types
 
 
 class TestEndToEnd:
