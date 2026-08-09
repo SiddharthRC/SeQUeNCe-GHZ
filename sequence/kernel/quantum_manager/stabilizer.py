@@ -18,6 +18,7 @@ from stim import TableauSimulator, Tableau, Circuit
 
 from .base import QuantumManager
 from ..quantum_state import StabilizerState
+from ...components.circuit import Circuit as SequenceCircuit
 from ...constants import STABILIZER_FORMALISM, SECOND
 from ...utils import log
 
@@ -159,42 +160,75 @@ class QuantumManagerStabilizer(QuantumManager):
         for key in keys:
             self.states[key] = state_obj
 
-    def run_circuit(self, circuit: Circuit, keys: list[int], inject_gate_error: bool = False) -> dict[int, int]:
-        """Execute a Stim circuit on stabilizer states.
+    # Native SeQUeNCe gate names (lowercase) to the stim instruction names that
+    # run_circuit already supports. Native measurements are carried separately
+    # via circuit.measured_qubits and mapped to "M" here.
+    _SEQUENCE_GATE_TO_STIM = {
+        "h": "H",
+        "x": "X",
+        "y": "Y",
+        "z": "Z",
+        "s": "S",
+        "sdg": "S_DAG",
+        "cx": "CX",
+        "cz": "CZ",
+        "swap": "SWAP",
+    }
 
-        Args:
-            circuit: Stim circuit to execute.
-            keys (list[int]): Ordered keys mapped to circuit qubit indices.
-            inject_gate_error: If True, execute ideal gates and then apply injected gate-noise channels.
-
-        Returns:
-            dict[int, int]: Measurement outcomes keyed by measured state keys.
-        """
-        # 1. Preparation
-        if not isinstance(circuit, Circuit):
-            raise TypeError(f"circuit must be Circuit from stim, got {type(circuit)}")
-
-        measured_qubits: list[int] = []
-        saw_measurement = False
-        supported_names = {"H", "X", "Y", "Z", "S", "S_DAG", "CX", "CZ", "SWAP", "M", "MX", "MY"}
+    def _parse_sequence_circuit(self, circuit, keys: list[int]) -> tuple[list[tuple[str, list[int]]], list[int]]:
+        """Translate a native SeQUeNCe circuit into (instruction_payloads, measured_qubits)."""
         instruction_payloads: list[tuple[str, list[int]]] = []
 
-        for instruction in circuit:
-            name = instruction.name
-            if name not in supported_names:
-                raise ValueError(f"Unsupported stim instruction for stabilizer manager: {name}")
-
-            targets = [int(target.value) for target in instruction.targets_copy()]
+        for gate_name, indices, _arg in circuit.gates:
+            stim_name = self._SEQUENCE_GATE_TO_STIM.get(gate_name.lower())
+            if stim_name is None:
+                raise ValueError(
+                    f"Unsupported SeQUeNCe gate for stabilizer manager: {gate_name}"
+                )
+            targets = [int(i) for i in indices]
             if any(target < 0 or target >= len(keys) for target in targets):
-                raise ValueError(f"Stim target out of range for {name}: {targets}")
+                raise ValueError(f"SeQUeNCe target out of range for {gate_name}: {targets}")
+            instruction_payloads.append((stim_name, targets))
 
-            if name in {"M", "MX", "MY"}:
-                saw_measurement = True
-                measured_qubits.extend(targets)
-            elif saw_measurement:
-                raise ValueError("Stabilizer manager only supports terminal measurements.")
-            instruction_payloads.append((name, targets))
+        measured_qubits: list[int] = [int(i) for i in circuit.measured_qubits]
+        if any(target < 0 or target >= len(keys) for target in measured_qubits):
+            raise ValueError(f"SeQUeNCe measured qubit out of range: {measured_qubits}")
+        for measured_target in measured_qubits:
+            instruction_payloads.append(("M", [measured_target]))
 
+        return instruction_payloads, measured_qubits
+
+    def run_circuit(self, circuit, keys: list[int], inject_gate_error: bool = False) -> dict[int, int]:
+        """Execute a Stim circuit or a native SeQUeNCe circuit on stabilizer states."""
+        # 1. Preparation. Both circuit types are reduced to instruction_payloads
+        # (a list of (stim_name, targets)) plus measured_qubits.
+        supported_names = {"H", "X", "Y", "Z", "S", "S_DAG", "CX", "CZ", "SWAP", "M", "MX", "MY"}
+        measured_qubits: list[int] = []
+        saw_measurement = False
+        instruction_payloads: list[tuple[str, list[int]]] = []
+
+        if isinstance(circuit, SequenceCircuit):
+            instruction_payloads, measured_qubits = self._parse_sequence_circuit(circuit, keys)
+        elif isinstance(circuit, Circuit):
+            for instruction in circuit:
+                name = instruction.name
+                if name not in supported_names:
+                    raise ValueError(f"Unsupported stim instruction for stabilizer manager: {name}")
+
+                targets = [int(target.value) for target in instruction.targets_copy()]
+                if any(target < 0 or target >= len(keys) for target in targets):
+                    raise ValueError(f"Stim target out of range for {name}: {targets}")
+
+                if name in {"M", "MX", "MY"}:
+                    saw_measurement = True
+                    measured_qubits.extend(targets)
+                elif saw_measurement:
+                    raise ValueError("Stabilizer manager only supports terminal measurements.")
+                instruction_payloads.append((name, targets))
+        else:
+            raise TypeError(
+                f"circuit must be a stim Circuit or a SeQUeNCe Circuit, got {type(circuit)}"
+            )
         # Prepare validated inputs, merged/shared topology, and key index mapping.
         state_obj, key_to_local = self._prepare_circuit(len(keys), measured_qubits, keys)
         if state_obj is None:
