@@ -22,6 +22,7 @@ import json
 import pytest
 from unittest.mock import MagicMock, patch
 from stim import Circuit
+from sequence.resource_management.memory_manager import MemoryInfo
 
 from sequence.entanglement_management.ghz.ghz_generation import (
     GHZGenerationA,
@@ -473,7 +474,6 @@ class TestEndToEnd:
             EntanglementGenerationA, EntanglementGenerationB,
         )
         from sequence.constants import BARRET_KOK
-        from sequence.resource_management.memory_manager import MemoryInfo
         from sequence.topology.node import QuantumRouter as QR
 
         EntanglementGenerationA.set_global_type(BARRET_KOK)
@@ -681,3 +681,68 @@ class TestTruncationMemoryMapping:
         assert len(node._neighbor_to_memory_idx) == MAX_DEGREE
         for i, neighbor in enumerate(exactly_at_cap):
             assert node._neighbor_to_memory_idx[neighbor] == i
+
+class TestBellStateCorrectness:
+    """Verifies generation produces a correct Bell state under the stabilizer
+    backend, guarding the corrective Hadamard in _entanglement_succeed.
+
+    Without that correction, a generated pair comes out in the ZX/XZ basis
+    (ZZ=0, XX=0) rather than a valid Bell state. This test asserts the pair
+    is a proper Phi+/Phi- (ZZ=+-1, XX=+-1), so removing the correction fails here.
+    """
+
+    def _generate_single_pair_state(self, tmp_path, seed):
+        import stim
+        from sequence.entanglement_management.generation import (
+            EntanglementGenerationA, EntanglementGenerationB,
+        )
+        from sequence.constants import BARRET_KOK
+        EntanglementGenerationA.set_global_type(BARRET_KOK)
+        EntanglementGenerationB.set_global_type(BARRET_KOK)
+
+        config = {
+            "stop_time": 10_000_000_000_000,
+            "nodes": [
+                {"name": "helper", "type": "QuantumRouter", "seed": seed, "memo_size": 1},
+                {"name": "n1", "type": "QuantumRouter", "seed": seed + 100, "memo_size": 1},
+            ],
+            "qconnections": [
+                {"node1": "helper", "node2": "n1", "attenuation": 0.0,
+                 "distance": 500, "type": "meet_in_the_middle"},
+            ],
+            "cconnections": [{"node1": "helper", "node2": "n1", "delay": 500000000}],
+        }
+        path = tmp_path / f"star_{seed}.json"
+        path.write_text(json.dumps(config))
+
+        topo = RouterNetTopo(str(path))
+        tl = topo.get_timeline()
+        tl.quantum_manager = QuantumManagerStabilizer(seed=seed)
+
+        routers = {r.name: r for r in topo.get_nodes_by_type(RouterNetTopo.QUANTUM_ROUTER)}
+        helper = routers["helper"]
+
+        ghz = GHZGenerationA(owner=helper, name="helper.GHZGenerationA",  # type: ignore[arg-type]
+                             neighbor_names=["n1"], success_base=1.0, t1_sec=1.0, t2_sec=0.5)
+        map_to_middle = getattr(helper, "map_to_middle_node", {})  # type: ignore[attr-defined]
+        helper.ghz_protocol = ghz  # type: ignore[attr-defined]
+        install_ghz_eg_rules(helper, {"n1": map_to_middle["n1"]})  # type: ignore[arg-type]
+
+        tl.init()
+        tl.run()
+
+        mem = helper.get_components_by_type("MemoryArray")[0][0]
+        info = helper.resource_manager.memory_manager[0]  # type: ignore[attr-defined]
+        assert info.state == MemoryInfo.ENTANGLED
+        state = tl.quantum_manager.get(mem.qstate_key)
+        return state.state
+
+    def test_generated_pair_is_valid_bell_state(self, tmp_path):
+        import stim
+        for seed in [0, 2, 3, 42]:
+            sim = self._generate_single_pair_state(tmp_path, seed)
+            assert sim.num_qubits == 2
+            zz = sim.peek_observable_expectation(stim.PauliString("ZZ"))
+            xx = sim.peek_observable_expectation(stim.PauliString("XX"))
+            assert abs(zz) == 1, f"seed={seed}: ZZ={zz}, not a Bell state (correction missing?)"
+            assert abs(xx) == 1, f"seed={seed}: XX={xx}, not a Bell state (correction missing?)"
