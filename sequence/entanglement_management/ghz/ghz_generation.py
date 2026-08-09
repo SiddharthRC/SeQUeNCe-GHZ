@@ -120,12 +120,42 @@ class GHZEntanglementGenerationA(BarretKokA):
         self.neighbor_name: str = other
 
     def _entanglement_succeed(self) -> None:
-        """Do the usual Bell pair bookkeeping, then notify GHZGenerationA."""
+        """Do the usual Bell pair bookkeeping, then notify GHZGenerationA.
+
+        Under the stabilizer backend, generation via SingleAtomBSM produces a
+        Bell pair in the ZX/XZ basis rather than the standard XX/ZZ (Phi) basis.
+        This is a deterministic basis offset from the single-atom BSM measurement
+        running under QuantumManagerStabilizer. A corrective Hadamard on the
+        neighbor qubit rotates ZX/XZ into ZZ/XX, yielding a proper Bell state
+        (Phi+ or Phi-, with the sign resolved by the usual Pauli corrections).
+        If the BSM's stabilizer-path behavior is fixed upstream, remove this H.
+        """
         self.memory.entangled_memory["node_id"] = self.remote_node_name  # type: ignore[index]
         self.memory.entangled_memory["memo_id"] = self.remote_memo_id    # type: ignore[index]
         self.memory.fidelity = self.memory.raw_fidelity                  # type: ignore[assignment]
+
+        # Corrective Hadamard on the neighbor qubit (see docstring). The neighbor
+        # key is read from the joint stabilizer state shared with the local qubit,
+        # since entangled_memory["memo_id"] is a memory name, not a qstate_key.
+        local_key = self.memory.qstate_key
+        qm = self.owner.timeline.quantum_manager
+        try:
+            shared_state = qm.get(local_key)
+            state_keys = list(shared_state.keys)
+            neighbor_keys = [k for k in state_keys if k != local_key]
+            if len(neighbor_keys) == 1:
+                neighbor_local_idx = state_keys.index(neighbor_keys[0])
+                correction = Circuit()
+                correction.append("H", [neighbor_local_idx])
+                qm.run_circuit(correction, state_keys)
+        except Exception as exc:
+            log.logger.warning(
+                f"{self.name}: basis correction skipped: {exc}"
+            )
+
         self.update_resource_manager(self.memory, MemoryInfo.ENTANGLED)
         self.ghz_protocol.notify_bell_ready(
+
             neighbor=self.neighbor_name,
             local_key=self.memory.qstate_key,
             neighbor_key=self.memory.entangled_memory.get("memo_id"),
