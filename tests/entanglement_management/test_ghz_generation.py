@@ -906,3 +906,147 @@ class TestGHZStateCorrectness:
     def test_full_cycle_produces_valid_ghz(self, tmp_path):
         for seed in [0, 1, 2, 7, 42]:
             self._run_cycle_and_check(tmp_path, seed)
+
+
+class TestHigherDegreeGHZ:
+    """Verifies the protocol produces a valid GHZ at higher degree (k=4, k=5),
+    not just the 3-neighbor case. Guards the k-generalization of fusion, BSM,
+    key allocation, and the neighbor correction receivers.
+    """
+
+    def _run_star(self, tmp_path, k, seed):
+        import stim
+        from sequence.entanglement_management.generation import (
+            EntanglementGenerationA, EntanglementGenerationB,
+        )
+        from sequence.constants import BARRET_KOK
+        EntanglementGenerationA.set_global_type(BARRET_KOK)
+        EntanglementGenerationB.set_global_type(BARRET_KOK)
+
+        neighbors = [f"n{i}" for i in range(1, k + 1)]
+        nodes = [{"name": "helper", "type": "QuantumRouter", "seed": seed, "memo_size": k}]
+        for i, nm in enumerate(neighbors):
+            nodes.append({"name": nm, "type": "QuantumRouter", "seed": seed + 10 + i, "memo_size": 1})
+        qconn = [{"node1": "helper", "node2": nm, "attenuation": 0.0,
+                  "distance": 500, "type": "meet_in_the_middle"} for nm in neighbors]
+        cconn = [{"node1": "helper", "node2": nm, "delay": 500000000} for nm in neighbors]
+        for a in range(len(neighbors)):
+            for b in range(a + 1, len(neighbors)):
+                cconn.append({"node1": neighbors[a], "node2": neighbors[b], "delay": 1000000000})
+        config = {"stop_time": 10_000_000_000_000, "nodes": nodes,
+                  "qconnections": qconn, "cconnections": cconn}
+        path = tmp_path / f"star_k{k}_{seed}.json"
+        path.write_text(json.dumps(config))
+
+        topo = RouterNetTopo(str(path))
+        tl = topo.get_timeline()
+        qm = QuantumManagerStabilizer(seed=seed)
+        tl.quantum_manager = qm
+        routers = {r.name: r for r in topo.get_nodes_by_type(RouterNetTopo.QUANTUM_ROUTER)}
+        helper = routers["helper"]
+        ghz = GHZGenerationA(owner=helper, name="helper.GHZGenerationA",  # type: ignore[arg-type]
+                             neighbor_names=neighbors, success_base=1.0, t1_sec=1.0, t2_sec=0.5)
+        map_to_middle = getattr(helper, "map_to_middle_node", {})  # type: ignore[attr-defined]
+        mnm = {n: map_to_middle[n] for n in neighbors}
+        helper.ghz_protocol = ghz  # type: ignore[attr-defined]
+        install_ghz_eg_rules(helper, mnm)  # type: ignore[arg-type]
+        tl.init(); tl.run()
+
+        nb_keys = [routers[n].get_components_by_type("MemoryArray")[0][0].qstate_key for n in neighbors]
+        state = qm.get(nb_keys[0])
+        joint = list(state.keys)
+        sim = state.state
+        local = {kk: i for i, kk in enumerate(joint)}
+        assert all(kk in local for kk in nb_keys), f"k={k}: neighbors not in one joint state: {joint}"
+        idxs = [local[kk] for kk in nb_keys]
+        n = sim.num_qubits
+        allx = ["_"] * n
+        for i in idxs: allx[i] = "X"
+        xx = sim.peek_observable_expectation(stim.PauliString("".join(allx)))
+        assert abs(xx) == 1, f"k={k}: all-X stabilizer = {xx}, not a valid GHZ"
+        for a in range(len(idxs) - 1):
+            s = ["_"] * n
+            s[idxs[a]] = "Z"; s[idxs[a + 1]] = "Z"
+            z = sim.peek_observable_expectation(stim.PauliString("".join(s)))
+            assert abs(z) == 1, f"k={k}: ZZ[{a}] = {z}, not a valid GHZ"
+
+    def test_k4_produces_valid_ghz(self, tmp_path):
+        self._run_star(tmp_path, k=4, seed=0)
+
+    def test_k5_produces_valid_ghz(self, tmp_path):
+        self._run_star(tmp_path, k=5, seed=0)
+
+
+class TestFailurePathBroadcast:
+    """Verifies the failure path: when a BSM fails the probabilistic check,
+    the helper broadcasts GENERATION_FAILED to all neighbors, sends no
+    GHZ_RESULT, and the simulation completes without error. Guards the
+    failure-handling branch of the fusion+BSM cycle and the receiver.
+    """
+
+    def test_forced_failure_broadcasts_and_no_ghz_result(self, tmp_path):
+        from sequence.entanglement_management.generation import (
+            EntanglementGenerationA, EntanglementGenerationB,
+        )
+        from sequence.constants import BARRET_KOK
+        EntanglementGenerationA.set_global_type(BARRET_KOK)
+        EntanglementGenerationB.set_global_type(BARRET_KOK)
+
+        config = {
+            "stop_time": 10_000_000_000_000,
+            "nodes": [
+                {"name": "helper", "type": "QuantumRouter", "seed": 0, "memo_size": 3},
+                {"name": "n1", "type": "QuantumRouter", "seed": 1, "memo_size": 1},
+                {"name": "n2", "type": "QuantumRouter", "seed": 2, "memo_size": 1},
+                {"name": "n3", "type": "QuantumRouter", "seed": 3, "memo_size": 1},
+            ],
+            "qconnections": [
+                {"node1": "helper", "node2": f"n{i}", "attenuation": 0.0,
+                 "distance": 500, "type": "meet_in_the_middle"} for i in (1, 2, 3)
+            ],
+            "cconnections": [
+                {"node1": "helper", "node2": f"n{i}", "delay": 500000000} for i in (1, 2, 3)
+            ] + [
+                {"node1": "n1", "node2": "n2", "delay": 1000000000},
+                {"node1": "n1", "node2": "n3", "delay": 1000000000},
+                {"node1": "n2", "node2": "n3", "delay": 1000000000},
+            ],
+        }
+        path = tmp_path / "star.json"
+        path.write_text(json.dumps(config))
+
+        topo = RouterNetTopo(str(path))
+        tl = topo.get_timeline()
+        qm = QuantumManagerStabilizer(seed=0)
+        tl.quantum_manager = qm
+        routers = {r.name: r for r in topo.get_nodes_by_type(RouterNetTopo.QUANTUM_ROUTER)}
+        helper = routers["helper"]
+        neighbor_names = ["n1", "n2", "n3"]
+
+        # success_base = 0.0 forces every BSM to fail its probabilistic check.
+        ghz = GHZGenerationA(owner=helper, name="helper.GHZGenerationA",  # type: ignore[arg-type]
+                             neighbor_names=neighbor_names, success_base=0.0,
+                             t1_sec=1.0, t2_sec=0.5)
+
+        sent = []
+        orig = helper.send_message
+        def traced(dst, msg, priority=None):
+            sent.append(str(getattr(msg, "msg_type", "")))
+            try:
+                return orig(dst, msg, priority) if priority is not None else orig(dst, msg)
+            except TypeError:
+                return orig(dst, msg)
+        helper.send_message = traced  # type: ignore[method-assign]
+
+        map_to_middle = getattr(helper, "map_to_middle_node", {})  # type: ignore[attr-defined]
+        mnm = {n: map_to_middle[n] for n in neighbor_names}
+        helper.ghz_protocol = ghz  # type: ignore[attr-defined]
+        install_ghz_eg_rules(helper, mnm)  # type: ignore[arg-type]
+
+        tl.init()
+        tl.run()  # must not raise even though every BSM fails
+
+        ghz_results = [s for s in sent if "GHZ_RESULT" in s]
+        failed = [s for s in sent if "GENERATION_FAILED" in s]
+        assert len(ghz_results) == 0, "GHZ_RESULT sent despite forced BSM failure"
+        assert len(failed) >= 1, "no GENERATION_FAILED broadcast on failure"
