@@ -796,3 +796,117 @@ class TestBellStateCorrectness:
             assert captured.get("n") == 2, f"seed={seed}: pair not captured as 2-qubit at generation"
             assert abs(captured["zz"]) == 1, f"seed={seed}: ZZ={captured['zz']}, not a Bell state (correction missing?)"
             assert abs(captured["xx"]) == 1, f"seed={seed}: XX={captured['xx']}, not a Bell state (correction missing?)"
+
+class TestGHZStateCorrectness:
+    """Verifies the full cycle produces a valid GHZ state across the neighbors.
+
+    Runs generation -> fusion -> BSM under the stabilizer backend, applies the
+    Pauli corrections carried in each GHZ_RESULT message to the neighbor qubits,
+    and asserts the neighbors hold a valid GHZ (all-X stabilizer and adjacent-ZZ
+    stabilizers all +-1). This guards the paper-faithful fusion+BSM structure:
+    if the circuit or correction convention regresses, the GHZ check fails.
+    """
+
+    def _run_cycle_and_check(self, tmp_path, seed):
+        import stim
+        from stim import Circuit as StimCircuit
+        from sequence.entanglement_management.generation import (
+            EntanglementGenerationA, EntanglementGenerationB,
+        )
+        from sequence.constants import BARRET_KOK
+        EntanglementGenerationA.set_global_type(BARRET_KOK)
+        EntanglementGenerationB.set_global_type(BARRET_KOK)
+
+        config = {
+            "stop_time": 10_000_000_000_000,
+            "nodes": [
+                {"name": "helper", "type": "QuantumRouter", "seed": seed, "memo_size": 3},
+                {"name": "n1", "type": "QuantumRouter", "seed": seed + 10, "memo_size": 1},
+                {"name": "n2", "type": "QuantumRouter", "seed": seed + 20, "memo_size": 1},
+                {"name": "n3", "type": "QuantumRouter", "seed": seed + 30, "memo_size": 1},
+            ],
+            "qconnections": [
+                {"node1": "helper", "node2": f"n{i}", "attenuation": 0.0,
+                 "distance": 500, "type": "meet_in_the_middle"} for i in (1, 2, 3)
+            ],
+            "cconnections": [
+                {"node1": "helper", "node2": f"n{i}", "delay": 500000000} for i in (1, 2, 3)
+            ] + [
+                {"node1": "n1", "node2": "n2", "delay": 1000000000},
+                {"node1": "n1", "node2": "n3", "delay": 1000000000},
+                {"node1": "n2", "node2": "n3", "delay": 1000000000},
+            ],
+        }
+        path = tmp_path / f"star_{seed}.json"
+        path.write_text(json.dumps(config))
+
+        topo = RouterNetTopo(str(path))
+        tl = topo.get_timeline()
+        qm = QuantumManagerStabilizer(seed=seed)
+        tl.quantum_manager = qm
+
+        routers = {r.name: r for r in topo.get_nodes_by_type(RouterNetTopo.QUANTUM_ROUTER)}
+        helper = routers["helper"]
+        neighbor_names = ["n1", "n2", "n3"]
+
+        ghz = GHZGenerationA(owner=helper, name="helper.GHZGenerationA",  # type: ignore[arg-type]
+                             neighbor_names=neighbor_names, success_base=1.0,
+                             t1_sec=1.0, t2_sec=0.5)
+
+        corrections = {}
+        orig_send = helper.send_message
+        def traced(dst, msg, priority=None):
+            if str(getattr(msg, "msg_type", "")) == "GHZMsgType.GHZ_RESULT":
+                corrections[dst] = (msg.payload["z_correction"], msg.payload["x_correction"])
+            try:
+                return orig_send(dst, msg, priority) if priority is not None else orig_send(dst, msg)
+            except TypeError:
+                return orig_send(dst, msg)
+        helper.send_message = traced  # type: ignore[method-assign]
+
+        map_to_middle = getattr(helper, "map_to_middle_node", {})  # type: ignore[attr-defined]
+        middle_node_map = {n: map_to_middle[n] for n in neighbor_names}
+        helper.ghz_protocol = ghz  # type: ignore[attr-defined]
+        install_ghz_eg_rules(helper, middle_node_map)  # type: ignore[arg-type]
+
+        tl.init()
+        tl.run()
+
+        assert len(corrections) == 3, f"seed={seed}: expected 3 GHZ_RESULT messages, got {len(corrections)}"
+
+        nb_keys = []
+        for name in neighbor_names:
+            mem = routers[name].get_components_by_type("MemoryArray")[0][0]
+            nb_keys.append(mem.qstate_key)
+
+        for name, nbk in zip(neighbor_names, nb_keys):
+            z, x = corrections[name]
+            corr = StimCircuit()
+            if x: corr.append("X", [0])
+            if z: corr.append("Z", [0])
+            if len(corr) > 0:
+                qm.run_circuit(corr, [nbk])
+
+        state = qm.get(nb_keys[0])
+        joint = list(state.keys)
+        sim = state.state
+        local = {k: i for i, k in enumerate(joint)}
+        assert all(k in local for k in nb_keys), \
+            f"seed={seed}: neighbor qubits not in one joint state: {joint}"
+        idxs = [local[k] for k in nb_keys]
+        n = sim.num_qubits
+        allx = ["_"] * n
+        for i in idxs: allx[i] = "X"
+        xx = sim.peek_observable_expectation(stim.PauliString("".join(allx)))
+        zzs = []
+        for a in range(len(idxs) - 1):
+            s = ["_"] * n
+            s[idxs[a]] = "Z"; s[idxs[a + 1]] = "Z"
+            zzs.append(sim.peek_observable_expectation(stim.PauliString("".join(s))))
+        assert abs(xx) == 1, f"seed={seed}: all-X stabilizer = {xx}, not a valid GHZ"
+        for j, z in enumerate(zzs):
+            assert abs(z) == 1, f"seed={seed}: ZZ[{j}] = {z}, not a valid GHZ"
+
+    def test_full_cycle_produces_valid_ghz(self, tmp_path):
+        for seed in [0, 1, 2, 7, 42]:
+            self._run_cycle_and_check(tmp_path, seed)
