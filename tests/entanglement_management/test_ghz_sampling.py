@@ -1,23 +1,16 @@
-"""Monte Carlo sampling harness for GHZ generation rate statistics.
+"""Monte Carlo sampling harness for GHZ generation statistics.
 
 The stabilizer backend (stim.TableauSimulator) tracks one sampled pure state
-trajectory per run, not a mixed state density matrix, so fidelity cannot be
-read off a single run. Instead the protocol is run N independent times with
-fixed parameters and statistics are computed across those N samples. About
-1000 samples gives a rate precision of about 0.001.
+trajectory per run, so a statistic is computed across N independent runs with
+fixed parameters rather than read off a single run. About 1000 samples gives a
+precision of about 0.001.
 
 Per Dr. Zhan (2026-07-20), fidelity here is the fraction of samples reaching the
-ideal state: if 9 of 10 generated pairs are the ideal state, fidelity is 0.9.
-The success_rate computed here is basically that same quantity.
-
-Limitation for now: this currently measures Bell pair generation only, not GHZ fusion.
-RouterNetTopo builds BSM components that pass sequence.components.circuit.Circuit
-to run_circuit, which QuantumManagerStabilizer rejects, so the topology uses
-QuantumManagerKet. GHZGenerationA requires the stabilizer manager, so
-_run_ghz_fusion fails its manager check and broadcasts failure every run. The
-fusion and BSM phases are therefore never exercised here. How to run stabilizer
-based fusion inside a RouterNetTopo timeline is an open question for the team.
-
+ideal state: if 9 of 10 runs yield the ideal GHZ, fidelity is 0.9. Each run
+executes the full protocol under QuantumManagerStabilizer: Bell pair generation,
+GHZ fusion on the helper, per-neighbor BSM, and live Pauli corrections on the
+neighbors. Two metrics are reported per run: bell_success (all links reached
+ENTANGLED) and ghz_valid (the neighbor qubits hold a valid GHZ state).
 
 Running from the repository root for my reference:
     python -m pytest tests/entanglement_management/test_ghz_sampling.py -v
@@ -27,7 +20,9 @@ import json
 from dataclasses import dataclass, field
 
 import pytest
+import stim
 
+from sequence.kernel.quantum_manager.stabilizer import QuantumManagerStabilizer
 from sequence.entanglement_management.ghz.ghz_generation import (
     GHZGenerationA,
 )
@@ -41,11 +36,13 @@ class SampleResult:
     """Outcome of a single independent generation attempt.
 
     Attributes:
-        all_entangled (bool): True if every link reached ENTANGLED in time.
+        bell_success (bool): True if every link reached ENTANGLED in time.
+        ghz_valid (bool): True if the neighbor qubits hold a valid GHZ state.
         entangled_count (int): links that reached ENTANGLED.
         total_links (int): links attempted.
     """
-    all_entangled: bool
+    bell_success: bool
+    ghz_valid: bool
     entangled_count: int
     total_links: int
 
@@ -56,12 +53,13 @@ class SamplingStats:
 
     Attributes:
         num_samples (int): independent runs performed.
-        success_rate (float): fraction of samples with all_entangled True.
-        results (list[SampleResult]): raw per sample results, kept for
-            further analysis such as a future fidelity statistic.
+        bell_success_rate (float): fraction of samples with bell_success True.
+        ghz_fidelity (float): fraction of samples with ghz_valid True.
+        results (list[SampleResult]): raw per sample results.
     """
     num_samples: int
-    success_rate: float
+    bell_success_rate: float
+    ghz_fidelity: float
     results: list = field(default_factory=list)
 
 
@@ -73,11 +71,11 @@ def _build_star_topo_config(
 
     Args:
         stop_time_ps (int): simulation stop time in picoseconds.
-        seed_offset (int): added to each node's seed so samples use distinct
+        seed_offset (int): added to each node''s seed so samples use distinct
             RNG streams.
 
     Returns:
-        dict: config for RouterNetTopo, matching TestEndToEnd's structure.
+        dict: config for RouterNetTopo.
     """
     return {
         "stop_time": stop_time_ps,
@@ -106,24 +104,59 @@ def _build_star_topo_config(
     }
 
 
+def _neighbors_hold_valid_ghz(qm, nb_keys: list[int]) -> bool:
+    """Check whether the neighbor qubits form a valid GHZ state.
+
+    A valid n-qubit GHZ is stabilized by the all-X operator and by each
+    adjacent Z_i Z_{i+1}, so every such expectation must be +-1.
+
+    Args:
+        qm (QuantumManagerStabilizer): the run''s quantum manager.
+        nb_keys (list[int]): the neighbor qubits'' qstate keys.
+
+    Returns:
+        bool: True if the qubits share one state and pass the GHZ check.
+    """
+    state = qm.get(nb_keys[0])
+    joint = list(state.keys)
+    local = {k: i for i, k in enumerate(joint)}
+    if not all(k in local for k in nb_keys):
+        return False
+    sim = state.state
+    n = sim.num_qubits
+    idxs = [local[k] for k in nb_keys]
+    allx = ["_"] * n
+    for i in idxs:
+        allx[i] = "X"
+    if abs(sim.peek_observable_expectation(stim.PauliString("".join(allx)))) != 1:
+        return False
+    for a in range(len(idxs) - 1):
+        s = ["_"] * n
+        s[idxs[a]] = "Z"
+        s[idxs[a + 1]] = "Z"
+        if abs(sim.peek_observable_expectation(stim.PauliString("".join(s)))) != 1:
+            return False
+    return True
+
+
 def _run_one_sample(
     topo_path: str,
     success_base: float = 1.0,
     t1_sec: float = 1.0,
     t2_sec: float = 0.5,
+    seed: int = 0,
 ) -> SampleResult:
     """Run one complete, independent generation attempt.
 
-    Builds a fresh Timeline, topology, and GHZGenerationA, runs to completion,
-    and reports whether all helper memories reached ENTANGLED. The quantum
-    manager is left as whatever RouterNetTopo provides; see the module
-    docstring for why it is not overridden to QuantumManagerStabilizer.
+    Builds a fresh Timeline and topology, forces QuantumManagerStabilizer, runs
+    the full protocol, and reports both Bell pair success and GHZ validity.
 
     Args:
         topo_path (str): path to a star topology JSON config.
         success_base (float): passed through to GHZGenerationA.
         t1_sec (float): passed through to GHZGenerationA.
         t2_sec (float): passed through to GHZGenerationA.
+        seed (int): seed for the stabilizer manager.
 
     Returns:
         SampleResult: outcome of this run.
@@ -138,6 +171,8 @@ def _run_one_sample(
 
     topo = RouterNetTopo(topo_path)
     tl = topo.get_timeline()
+    qm = QuantumManagerStabilizer(seed=seed)
+    tl.quantum_manager = qm
 
     routers = {r.name: r for r in topo.get_nodes_by_type(RouterNetTopo.QUANTUM_ROUTER)}
     helper = routers["helper"]  # type: ignore[assignment]
@@ -162,13 +197,26 @@ def _run_one_sample(
     tl.run()
 
     entangled_count = 0
-    for idx, _neighbor in enumerate(neighbor_names):
+    for idx in range(len(neighbor_names)):
         info = helper.resource_manager.memory_manager[idx]  # type: ignore[attr-defined]
         if info.state == MemoryInfo.ENTANGLED:
             entangled_count += 1
+    bell_success = entangled_count == len(neighbor_names)
+
+    ghz_valid = False
+    if bell_success:
+        nb_keys = [
+            routers[n].get_components_by_type("MemoryArray")[0][0].qstate_key
+            for n in neighbor_names
+        ]
+        try:
+            ghz_valid = _neighbors_hold_valid_ghz(qm, nb_keys)
+        except Exception:
+            ghz_valid = False
 
     return SampleResult(
-        all_entangled=(entangled_count == len(neighbor_names)),
+        bell_success=bell_success,
+        ghz_valid=ghz_valid,
         entangled_count=entangled_count,
         total_links=len(neighbor_names),
     )
@@ -183,14 +231,9 @@ def run_sampling(
 ) -> SamplingStats:
     """Run num_samples independent attempts and aggregate the results.
 
-    Each sample builds a fresh Timeline and topology with a distinct seed
-    offset. One sample is one complete run of the protocol, not a single
-    fusion attempt within a shared run.
-
     Args:
         num_samples (int): independent samples to run.
-        tmp_path: pytest tmp_path fixture, or any Path like directory, for
-            writing per sample topology JSON files.
+        tmp_path: pytest tmp_path fixture, or any Path like directory.
         success_base (float): passed through to each GHZGenerationA.
         t1_sec (float): passed through to each GHZGenerationA.
         t2_sec (float): passed through to each GHZGenerationA.
@@ -209,13 +252,16 @@ def run_sampling(
             success_base=success_base,
             t1_sec=t1_sec,
             t2_sec=t2_sec,
+            seed=i * 10,
         )
         results.append(result)
 
-    successes = sum(1 for r in results if r.all_entangled)
+    bell_successes = sum(1 for r in results if r.bell_success)
+    ghz_valids = sum(1 for r in results if r.ghz_valid)
     return SamplingStats(
         num_samples=num_samples,
-        success_rate=successes / num_samples,
+        bell_success_rate=bell_successes / num_samples,
+        ghz_fidelity=ghz_valids / num_samples,
         results=results,
     )
 
@@ -228,7 +274,6 @@ class TestGHZSampling:
     """
 
     def test_single_sample_returns_valid_result(self, tmp_path):
-        # A single sample should return a SampleResult with sane fields.
         config = _build_star_topo_config()
         topo_path = tmp_path / "star_network.json"
         topo_path.write_text(json.dumps(config))
@@ -237,35 +282,36 @@ class TestGHZSampling:
 
         assert result.total_links == 3
         assert 0 <= result.entangled_count <= result.total_links
-        assert result.all_entangled == (result.entangled_count == result.total_links)
+        assert result.bell_success == (result.entangled_count == result.total_links)
 
-    def test_success_base_one_always_succeeds_across_samples(self, tmp_path):
-        # With success_base 1.0, Bell pair generation completes on all links
-        # in every sample.
+    def test_success_base_one_yields_valid_ghz_across_samples(self, tmp_path):
         stats = run_sampling(num_samples=5, tmp_path=tmp_path, success_base=1.0)
 
         assert stats.num_samples == 5
-        assert stats.success_rate == 1.0
-        assert all(r.all_entangled for r in stats.results)
+        assert stats.bell_success_rate == 1.0
+        assert stats.ghz_fidelity == 1.0
+        assert all(r.ghz_valid for r in stats.results)
 
-    def test_success_rate_is_fraction_between_zero_and_one(self, tmp_path):
-        # success_rate should always be a valid fraction.
+    def test_rates_are_fractions_between_zero_and_one(self, tmp_path):
         stats = run_sampling(num_samples=5, tmp_path=tmp_path, success_base=1.0)
-        assert 0.0 <= stats.success_rate <= 1.0
+        assert 0.0 <= stats.bell_success_rate <= 1.0
+        assert 0.0 <= stats.ghz_fidelity <= 1.0
+
+    def test_forced_bsm_failure_gives_zero_fidelity(self, tmp_path):
+        stats = run_sampling(num_samples=5, tmp_path=tmp_path, success_base=0.0)
+        assert stats.ghz_fidelity == 0.0
 
     def test_samples_are_independent_fresh_runs(self, tmp_path):
-        # Each sample should use a distinct topology file and fresh objects.
         stats = run_sampling(num_samples=3, tmp_path=tmp_path, success_base=1.0)
 
         assert len(stats.results) == 3
-        # Distinct object identities, so no shared mutable state.
         assert len(set(id(r) for r in stats.results)) == 3
 
     def test_stats_dataclass_fields_consistent(self, tmp_path):
-        # num_samples should match len(results), and success_rate should match
-        # the counted fraction.
         stats = run_sampling(num_samples=4, tmp_path=tmp_path, success_base=1.0)
 
         assert stats.num_samples == len(stats.results)
-        expected_rate = sum(1 for r in stats.results if r.all_entangled) / 4
-        assert stats.success_rate == expected_rate
+        expected_bell = sum(1 for r in stats.results if r.bell_success) / 4
+        expected_ghz = sum(1 for r in stats.results if r.ghz_valid) / 4
+        assert stats.bell_success_rate == expected_bell
+        assert stats.ghz_fidelity == expected_ghz
