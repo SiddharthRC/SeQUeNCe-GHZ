@@ -360,6 +360,9 @@ class TestSuccessProbability:
         node.ghz_protocol._local_keys = dict(zip(node.neighbor_names, local_keys))
         node.ghz_protocol._neighbor_keys = neighbor_keys
         node.ghz_protocol._ready_neighbors = set(node.neighbor_names)
+        # GHZ qubits are prepared in _run_ghz_fusion before _run_bsm_phase is
+        # called; tests invoking _run_bsm_phase directly must populate them.
+        node.ghz_protocol._ghz_keys = [qm.new() for _ in node.neighbor_names]
         return node, send_mock, local_keys
 
     def test_single_neighbor_success_sends_result(self):

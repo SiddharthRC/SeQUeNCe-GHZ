@@ -219,6 +219,7 @@ class GHZGenerationA(Protocol):
         self._ready_neighbors: set[str] = set()
         self._neighbor_keys: dict[str, int] = {}
         self._local_keys: dict[str, int] = {}
+        self._ghz_keys: list[int] = []
         self._cycle_count: int = 0
 
     def init(self) -> None:
@@ -325,6 +326,7 @@ class GHZGenerationA(Protocol):
 
         ordered = list(self.neighbor_names)
         local_keys = [self._local_keys[n] for n in ordered]
+        k = len(local_keys)
 
         try:
             qm.apply_idling_decoherence(
@@ -335,19 +337,28 @@ class GHZGenerationA(Protocol):
             self._broadcast_failure()
             return
 
-        fusion_circuit = Circuit()
-        for target_idx in range(1, len(local_keys)):
-            fusion_circuit.append("CX", [0, target_idx])
-        fusion_circuit.append("H", [0])
+        # Prepare the k-qubit GHZ on dedicated helper qubits, separate from the
+        # Bell-pair qubits (per Chen et al. Sec. 3: the helper generates a k-GHZ
+        # stored locally, then BSMs each GHZ qubit against a Bell-pair qubit).
+        # Ensure GHZ-qubit keys do not collide with existing memory/Bell-pair
+        # keys, since memory qstate_keys are assigned outside qm.new()'s counter.
+        if qm.states:
+            qm._least_available = max(qm._least_available, max(qm.states.keys()) + 1)
+        self._ghz_keys = [qm.new() for _ in range(k)]
+        ghz_circuit = Circuit()
+        ghz_circuit.append("H", [0])
+        for target_idx in range(1, k):
+            ghz_circuit.append("CX", [0, target_idx])
 
         try:
-            qm.run_circuit(fusion_circuit, local_keys, inject_gate_error=True)
+            qm.run_circuit(ghz_circuit, self._ghz_keys, inject_gate_error=True)
         except Exception as exc:
-            log.logger.error(f"{self.name}: fusion circuit failed: {exc}")
+            log.logger.error(f"{self.name}: GHZ preparation failed: {exc}")
             self._broadcast_failure()
             return
 
         self._run_bsm_phase(ordered, local_keys)
+
 
     def _run_bsm_phase(self, ordered_neighbors: list[str], local_keys: list[int]) -> None:
         """Run BSM on each (GHZ qubit, neighbor qubit) pair and send corrections.
@@ -381,8 +392,8 @@ class GHZGenerationA(Protocol):
         bsm_circuit.append("M", [1])
 
         for i, neighbor in enumerate(ordered_neighbors):
-            local_key = local_keys[i]
-            neighbor_key = self._neighbor_keys[neighbor]
+            ghz_key = self._ghz_keys[i]
+            bell_key = local_keys[i]
 
             if self._random() >= self.success_base:
                 log.logger.info(
@@ -392,17 +403,22 @@ class GHZGenerationA(Protocol):
                 self._broadcast_failure()
                 return
 
+            # BSM between the helper's GHZ qubit and its Bell-pair qubit, which
+            # teleports the GHZ leaf onto the neighbor's qubit up to a Pauli
+            # correction. z_correction is the GHZ-qubit measurement, x_correction
+            # the Bell-pair-qubit measurement (convention verified to yield a
+            # canonical GHZ across the neighbors after they apply X^x Z^z).
             try:
                 results = qm.run_circuit(
-                    bsm_circuit, [local_key, neighbor_key], inject_gate_error=True
+                    bsm_circuit, [ghz_key, bell_key], inject_gate_error=True
                 )
             except Exception as exc:
                 log.logger.error(f"{self.name}: BSM failed for {neighbor}: {exc}")
                 self._broadcast_failure()
                 return
 
-            m0 = results.get(local_key, 0)
-            m1 = results.get(neighbor_key, 0)
+            m0 = results.get(ghz_key, 0)
+            m1 = results.get(bell_key, 0)
 
             msg = GHZMessage(
                 GHZMsgType.GHZ_RESULT,
@@ -415,7 +431,6 @@ class GHZGenerationA(Protocol):
             log.logger.info(
                 f"{self.name}: GHZ_RESULT sent to {neighbor} (x={m1}, z={m0})."
             )
-
         log.logger.info(f"{self.name}: cycle {self._cycle_count} complete.")
 
     def _broadcast_failure(self) -> None:
@@ -434,6 +449,7 @@ class GHZGenerationA(Protocol):
 
     def _reset_cycle_state(self) -> None:
         """Clear per-cycle tracking state."""
+        self._ghz_keys = []
         self._ready_neighbors = set()
         self._neighbor_keys = {}
         self._local_keys = {}
