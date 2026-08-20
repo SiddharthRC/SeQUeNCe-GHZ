@@ -879,13 +879,9 @@ class TestGHZStateCorrectness:
             mem = routers[name].get_components_by_type("MemoryArray")[0][0]
             nb_keys.append(mem.qstate_key)
 
-        for name, nbk in zip(neighbor_names, nb_keys):
-            z, x = corrections[name]
-            corr = StimCircuit()
-            if x: corr.append("X", [0])
-            if z: corr.append("Z", [0])
-            if len(corr) > 0:
-                qm.run_circuit(corr, [nbk])
+        # No external corrections: the GHZCorrectionReceiver on each neighbor
+        # applies X^x Z^z live during the run. If the neighbors hold a valid GHZ
+        # here, the full end-to-end path (fusion, BSM, routing, correction) works.
 
         state = qm.get(nb_keys[0])
         joint = list(state.keys)

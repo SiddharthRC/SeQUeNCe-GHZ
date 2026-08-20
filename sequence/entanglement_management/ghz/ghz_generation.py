@@ -155,6 +155,66 @@ class GHZEntanglementGenerationA(BarretKokA):
         )
 
 
+class GHZCorrectionReceiver(Protocol):
+    """Neighbor-side handler that applies the Pauli correction from a GHZ_RESULT.
+
+    Installed on each neighbor node, named "{neighbor}.GHZGenerationA" so it
+    matches the receiver field the helper sets on GHZ_RESULT messages. On
+    GHZ_RESULT it applies X^x_correction then Z^z_correction to the neighbor's
+    memory qubit, completing that qubit's share of the distributed GHZ state
+    (Chen et al., arXiv:2604.03155, Sec. 3). On GENERATION_FAILED it takes no
+    quantum action; the memory is released through the normal resource path.
+    """
+
+    def __init__(self, owner: "QuantumRouter", name: str, memory: "Memory"):
+        """Constructor for the correction receiver.
+
+        Args:
+            owner (QuantumRouter): the neighbor node this runs on.
+            name (str): protocol name, must equal "{neighbor}.GHZGenerationA".
+            memory (Memory): the neighbor memory holding its GHZ-share qubit.
+        """
+        super().__init__(owner, name)
+        owner.protocols.append(self)
+        self.memory = memory
+
+    def received_message(self, src: str, msg: "Message") -> bool:
+        """Apply the Pauli correction carried by a GHZ_RESULT message.
+
+        Args:
+            src (str): name of the sending (helper) node.
+            msg (Message): the GHZMessage; payload has x_correction, z_correction.
+
+        Returns:
+            bool: True if the message was handled.
+        """
+        if msg.msg_type == GHZMsgType.GHZ_RESULT:
+            x_correction = msg.payload["x_correction"]
+            z_correction = msg.payload["z_correction"]
+            key = self.memory.qstate_key
+            qm = self.owner.timeline.quantum_manager
+            correction = Circuit()
+            if x_correction:
+                correction.append("X", [0])
+            if z_correction:
+                correction.append("Z", [0])
+            if len(correction) > 0:
+                try:
+                    qm.run_circuit(correction, [key])
+                except Exception as exc:
+                    log.logger.error(
+                        f"{self.name}: failed to apply GHZ correction: {exc}"
+                    )
+            log.logger.info(
+                f"{self.name}: applied GHZ correction "
+                f"(x={x_correction}, z={z_correction})."
+            )
+            return True
+        if msg.msg_type == GHZMsgType.GENERATION_FAILED:
+            log.logger.info(f"{self.name}: cycle failed; no correction applied.")
+            return True
+        return False
+
 class GHZGenerationA(Protocol):
     """GHZ state generation protocol on the central helper node.
 

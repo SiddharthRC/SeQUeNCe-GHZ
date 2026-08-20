@@ -21,7 +21,7 @@ from ..generation.generation_base import EntanglementGenerationA
 from ...resource_management.memory_manager import MemoryInfo
 from ...resource_management.rule_manager import Rule
 from ...topology.node import QuantumRouter
-from .ghz_generation import GHZEntanglementGenerationA
+from .ghz_generation import GHZEntanglementGenerationA, GHZCorrectionReceiver
 
 if TYPE_CHECKING:
     from ...resource_management.memory_manager import MemoryManager
@@ -207,3 +207,14 @@ def install_ghz_eg_rules(ghz_node: "GHZNode", middle_node_map: dict[str, str]) -
             condition_args=condition_args_neighbor,
         )
         neighbor_node.resource_manager.load(rule_await)
+
+        # Install a correction receiver on the neighbor, named to match the
+        # helper's GHZ_RESULT receiver field ("{neighbor}.GHZGenerationA"), so
+        # the routed message reaches it and the Pauli correction is applied to
+        # the neighbor's GHZ-share qubit (memory index 0).
+        neighbor_memory = neighbor_node.get_components_by_type("MemoryArray")[0][neighbor_memory_index]
+        GHZCorrectionReceiver(
+            owner=neighbor_node,
+            name=f"{neighbor_name}.GHZGenerationA",
+            memory=neighbor_memory,
+        )
