@@ -337,3 +337,38 @@ class TestGHZSampling:
         expected_ghz = sum(1 for r in stats.results if r.ghz_valid) / 4
         assert stats.bell_success_rate == expected_bell
         assert stats.ghz_fidelity == expected_ghz
+
+    def test_validity_metric_detects_pauli_errors(self):
+        """The GHZ validity check must reject uncorrected bit-flips.
+
+        Guards against regressing _neighbors_hold_valid_ghz to a magnitude-only
+        stabilizer check, which accepts any Pauli frame and so silently passes a
+        GHZ carrying an uncorrected single-qubit X (the ~19% neighbor-correction
+        bug). A clean GHZ and any single-qubit-Z frame must pass; a single X or Y
+        on any leg must fail.
+        """
+        from stim import TableauSimulator
+        from sequence.kernel.quantum_state.stabilizer import StabilizerState
+
+        def qm_with_ghz(gate=None, pos=0):
+            qm = QuantumManagerStabilizer(seed=0)
+            sim = TableauSimulator()
+            sim.set_num_qubits(3)
+            sim.h(0)
+            sim.cx(0, 1)
+            sim.cx(0, 2)
+            if gate:
+                getattr(sim, gate)(pos)
+            st = StabilizerState(state=sim, keys=[0, 1, 2])
+            qm.states[0] = qm.states[1] = qm.states[2] = st
+            return qm
+
+        # Clean GHZ and any single-qubit-Z frame are valid.
+        assert _neighbors_hold_valid_ghz(qm_with_ghz(), [0, 1, 2])
+        assert _neighbors_hold_valid_ghz(qm_with_ghz("z", 0), [0, 1, 2])
+        assert _neighbors_hold_valid_ghz(qm_with_ghz("z", 1), [0, 1, 2])
+
+        # A single X or Y on any leg is an uncorrected bit-flip: must be rejected.
+        for pos in range(3):
+            assert not _neighbors_hold_valid_ghz(qm_with_ghz("x", pos), [0, 1, 2])
+            assert not _neighbors_hold_valid_ghz(qm_with_ghz("y", pos), [0, 1, 2])
