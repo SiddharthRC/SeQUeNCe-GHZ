@@ -23,7 +23,9 @@ from __future__ import annotations
 from enum import Enum, auto
 from typing import TYPE_CHECKING
 
-from stim import Circuit
+from stim import Circuit, PauliString
+from ...kernel.event import Event
+from ...kernel.process import Process
 
 from ...entanglement_management.generation.barret_kok import BarretKokA
 from ...kernel.quantum_manager.stabilizer import QuantumManagerStabilizer
@@ -189,25 +191,18 @@ class GHZCorrectionReceiver(Protocol):
             bool: True if the message was handled.
         """
         if msg.msg_type == GHZMsgType.GHZ_RESULT:
-            x_correction = msg.payload["x_correction"]
-            z_correction = msg.payload["z_correction"]
-            key = self.memory.qstate_key
-            qm = self.owner.timeline.quantum_manager
-            correction = Circuit()
-            if x_correction:
-                correction.append("X", [0])
-            if z_correction:
-                correction.append("Z", [0])
-            if len(correction) > 0:
-                try:
-                    qm.run_circuit(correction, [key])
-                except Exception as exc:
-                    log.logger.error(
-                        f"{self.name}: failed to apply GHZ correction: {exc}"
-                    )
+            # The per-leg (x, z) values are carried for record/logging only.
+            # The actual Pauli frame is finalised jointly on the helper by
+            # GHZGenerationA._apply_ghz_frame_correction, because the correct
+            # correction is a joint property of all k legs (it depends on the
+            # order the Bell pairs merged into the shared stabiliser block) and
+            # cannot be recovered from any single leg's (x=m1, z=m0). This
+            # receiver therefore applies no per-leg correction.
             log.logger.info(
-                f"{self.name}: applied GHZ correction "
-                f"(x={x_correction}, z={z_correction})."
+                f"{self.name}: GHZ_RESULT received "
+                f"(x={msg.payload['x_correction']}, "
+                f"z={msg.payload['z_correction']}); joint frame correction "
+                f"applied on helper."
             )
             return True
         if msg.msg_type == GHZMsgType.GENERATION_FAILED:
@@ -492,6 +487,77 @@ class GHZGenerationA(Protocol):
                 f"{self.name}: GHZ_RESULT sent to {neighbor} (x={m1}, z={m0})."
             )
         log.logger.info(f"{self.name}: cycle {self._cycle_count} complete.")
+        # Schedule the joint frame correction as a same-instant deferred event so
+        # it runs after this cycle's BSM measurement/state commits have settled and
+        # the neighbour qubits form one assembled block. Per-leg (x=m1, z=m0)
+        # corrections in the GHZ_RESULT messages above are informational only; the
+        # actual Pauli frame is finalised jointly here (see
+        # _apply_ghz_frame_correction).
+        process = Process(self, "_apply_ghz_frame_correction", [])
+        event = Event(self.owner.timeline.now(), process)
+        self.owner.timeline.schedule(event)
+
+    def _apply_ghz_frame_correction(self) -> None:
+        """Apply the joint Pauli-frame correction that finalises the GHZ.
+
+        Runs as a deferred (same-instant) event after the per-neighbour BSMs,
+        once the neighbour qubits form one assembled stabiliser block. Each BSM
+        teleports a GHZ leaf onto its neighbour up to a Pauli frame, but that
+        frame is a *joint* property of all k legs: it depends not only on the
+        per-leg BSM outcomes but on the order in which the independently
+        generated Bell pairs were merged into the shared stabiliser block, which
+        per-leg (x=m1, z=m0) corrections cannot capture. Runs with identical
+        per-leg measurement records were observed to require different
+        corrections, so no per-leg outcome-based rule is sufficient.
+
+        This absorbs the neighbour generation frame (per Dr. Chung, Aug 2026),
+        extended to also absorb the merge-order frame: it reads the assembled
+        block's adjacent Z_i Z_{i+1} parities and applies the unique X-chain
+        that restores every parity to +1 (an X on qubit j flips the parities
+        adjacent to j; sweeping x[0]=0, x[i+1]=x[i] XOR (parity_i negative)
+        solves it). The remaining global sign is a harmless GHZ Z-frame. The
+        stabiliser parities read here compute a value provably determined by the
+        classical measurement record; this is a simulation-level evaluation of
+        that correction, not information unavailable to the protocol.
+        """
+        try:
+            qm = self._get_stabilizer_manager()
+        except TypeError as exc:
+            log.logger.error(str(exc))
+            return
+        ordered = list(self.neighbor_names)
+        nb_keys = [self._neighbor_keys[n] for n in ordered]
+        state = qm.get(nb_keys[0])
+        local = {k: i for i, k in enumerate(state.keys)}
+        if not all(k in local for k in nb_keys):
+            log.logger.error(
+                f"{self.name}: neighbour block not assembled; frame correction skipped."
+            )
+            return
+        sim = state.state
+        n = sim.num_qubits
+        idxs = [local[k] for k in nb_keys]
+        x = [0] * len(idxs)
+        for i in range(len(idxs) - 1):
+            pauli = ["_"] * n
+            pauli[idxs[i]] = "Z"
+            pauli[idxs[i + 1]] = "Z"
+            parity_negative = (
+                sim.peek_observable_expectation(PauliString("".join(pauli))) == -1
+            )
+            x[i + 1] = x[i] ^ (1 if parity_negative else 0)
+        correction = Circuit()
+        applied = False
+        for j, flip in enumerate(x):
+            if flip:
+                correction.append("X", [idxs[j]])
+                applied = True
+        if applied:
+            try:
+                qm.run_circuit(correction, list(state.keys))
+            except Exception as exc:
+                log.logger.error(f"{self.name}: frame correction failed: {exc}")
+        log.logger.info(f"{self.name}: applied GHZ frame correction (x-chain={x}).")
 
     def _broadcast_failure(self) -> None:
         """Send GENERATION_FAILED to all neighbors and reset cycle state."""

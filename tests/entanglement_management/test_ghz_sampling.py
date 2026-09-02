@@ -298,14 +298,6 @@ class TestGHZSampling:
         assert 0 <= result.entangled_count <= result.total_links
         assert result.bell_success == (result.entangled_count == result.total_links)
 
-    @pytest.mark.xfail(
-        reason="Neighbor-side EntanglementGenerationA correction is not "
-        "reconciled with the GHZ BSM correction, leaving an uncorrected X on "
-        "~19% of legs at ideal parameters. Pending intended-handling "
-        "confirmation (see GHZ neighbor-correction thread). Frame-aware "
-        "metric now detects this.",
-        strict=False,
-    )
     def test_success_base_one_yields_valid_ghz_across_samples(self, tmp_path):
         stats = run_sampling(num_samples=25, tmp_path=tmp_path, success_base=1.0)
 
