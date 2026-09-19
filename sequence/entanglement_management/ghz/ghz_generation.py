@@ -418,16 +418,17 @@ class GHZGenerationA(Protocol):
     def _run_bsm_phase(self, ordered_neighbors: list[str], local_keys: list[int]) -> None:
         """Run BSM on each (GHZ qubit, neighbor qubit) pair and send corrections.
 
-        Per neighbor: a single-q probabilistic success check, then CX(local->
-        neighbor), H(local), M(local), M(neighbor). Outcomes (m0, m1) give the Z
-        and X corrections sent via GHZ_RESULT.
-
         Per the hybrid GHZ-BSM protocol (Chen et al., arXiv:2604.03155, Sec.~3),
-        each helper BSM succeeds with a single probability q (success_base), not
-        the q^(k-1) exponential-decay term (confirmed by Dr. Chung, Aug 2026).
-        A failed BSM fails the whole cycle via _broadcast_failure; treating one
-        neighbor's failure as a whole-cycle failure is a simplifying assumption
-        for this first implementation rather than a per-link partial success.
+        GHZ state generation is deterministic local preparation, and the
+        probabilistic success attaches to the GHZ measurement (this BSM step).
+        The k-qubit GHZ measurement succeeds with a single probability
+        q^(k-1) (confirmed by Xinan Chen, Sep 2026), applied once here as a
+        whole-measurement pass/fail rather than a per-neighbor draw. On
+        failure the whole cycle fails via _broadcast_failure.
+
+        Per neighbor, on success: CX(local->neighbor), H(local), M(local),
+        M(neighbor); outcomes (m0, m1) give the Z and X corrections sent via
+        GHZ_RESULT.
 
         Args:
             ordered_neighbors (list[str]): neighbor names, same order as local_keys.
@@ -440,6 +441,19 @@ class GHZGenerationA(Protocol):
             self._broadcast_failure()
             return
 
+        # Single q^(k-1) success check for the whole k-qubit GHZ measurement
+        # (Xinan Chen, Sep 2026): generation is deterministic; the measurement
+        # routing succeeds with probability q^(k-1). On failure the cycle fails.
+        k = len(ordered_neighbors)
+        measurement_success_prob = self.success_base ** (k - 1)
+        if self._random() >= measurement_success_prob:
+            log.logger.info(
+                f"{self.name}: GHZ measurement failed probabilistic check "
+                f"(q^(k-1)={measurement_success_prob:.4f}). Broadcasting failure."
+            )
+            self._broadcast_failure()
+            return
+
         bsm_circuit = Circuit()
         bsm_circuit.append("CX", [0, 1])
         bsm_circuit.append("H", [0])
@@ -449,14 +463,6 @@ class GHZGenerationA(Protocol):
         for i, neighbor in enumerate(ordered_neighbors):
             ghz_key = self._ghz_keys[i]
             bell_key = local_keys[i]
-
-            if self._random() >= self.success_base:
-                log.logger.info(
-                    f"{self.name}: BSM failed probabilistic check for {neighbor} "
-                    f"(q={self.success_base:.4f}). Broadcasting failure."
-                )
-                self._broadcast_failure()
-                return
 
             # BSM between the helper's GHZ qubit and its Bell-pair qubit, which
             # teleports the GHZ leaf onto the neighbor's qubit up to a Pauli

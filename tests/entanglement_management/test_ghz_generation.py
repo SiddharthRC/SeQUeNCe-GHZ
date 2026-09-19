@@ -396,10 +396,14 @@ class TestSuccessProbability:
         assert all(t == GHZMsgType.GENERATION_FAILED for t in sent_types)
 
     def test_zero_success_base_always_fails(self):
-        # success_base=0.0 means random() >= 0.0 always holds, so BSM always fails.
-        node, send_mock, local_keys = self._setup_node_ready_for_bsm(["n1"], success_base=0.0)
+        # success_base=0.0 with k>=2 neighbors gives q^(k-1) = 0, so random() >=
+        # 0.0 always holds and the whole GHZ measurement always fails. (For k=1,
+        # q^(k-1) = q^0 = 1, so a single-neighbor measurement never fails on q;
+        # that trivial case is covered separately.)
+        neighbors = ["n1", "n2"]
+        node, send_mock, local_keys = self._setup_node_ready_for_bsm(neighbors, success_base=0.0)
         with patch.object(node.ghz_protocol, "_random", return_value=0.0):
-            node.ghz_protocol._run_bsm_phase(["n1"], local_keys)
+            node.ghz_protocol._run_bsm_phase(neighbors, local_keys)
         sent_types = [c.args[1].msg_type for c in send_mock.call_args_list]
         assert GHZMsgType.GENERATION_FAILED in sent_types
         assert GHZMsgType.GHZ_RESULT not in sent_types
@@ -415,19 +419,29 @@ class TestSuccessProbability:
         assert sent_types.count(GHZMsgType.GHZ_RESULT) == len(neighbors)
         assert GHZMsgType.GENERATION_FAILED not in sent_types
 
-    def test_q_is_flat_not_exponential_in_k(self):
-        # The per-BSM check uses a flat q, independent of k: the same draw just
-        # below q passes for any number of neighbors (unlike the old q^(k-1)).
-        draw = 0.85  # < 0.9, so each individual BSM check passes
-        for neighbors in [["n1"], ["n1", "n2"], ["n1", "n2", "n3"]]:
-            node, send_mock, local_keys = self._setup_node_ready_for_bsm(
-                neighbors, success_base=0.9
-            )
-            with patch.object(node.ghz_protocol, "_random", return_value=draw):
-                node.ghz_protocol._run_bsm_phase(neighbors, local_keys)
-            sent_types = [c.args[1].msg_type for c in send_mock.call_args_list]
-            assert sent_types.count(GHZMsgType.GHZ_RESULT) == len(neighbors)
-            assert GHZMsgType.GENERATION_FAILED not in sent_types
+    def test_success_is_q_pow_k_minus_1_in_k(self):
+        # Per Xinan Chen (Sep 2026), the k-qubit GHZ measurement succeeds with a
+        # single probability q^(k-1), so the success threshold shrinks as k grows
+        # (exponential in k, not flat). A draw of 0.85 with q=0.9 passes for k=2
+        # (q^1 = 0.90 > 0.85) but fails for k=3 (q^2 = 0.81 < 0.85).
+        q = 0.9
+        draw = 0.85
+        # k=2: threshold q^(k-1) = 0.90 > draw -> succeeds, both neighbors get GHZ_RESULT
+        neighbors = ["n1", "n2"]
+        node, send_mock, local_keys = self._setup_node_ready_for_bsm(neighbors, success_base=q)
+        with patch.object(node.ghz_protocol, "_random", return_value=draw):
+            node.ghz_protocol._run_bsm_phase(neighbors, local_keys)
+        sent_types = [c.args[1].msg_type for c in send_mock.call_args_list]
+        assert sent_types.count(GHZMsgType.GHZ_RESULT) == len(neighbors)
+        assert GHZMsgType.GENERATION_FAILED not in sent_types
+        # k=3: threshold q^(k-1) = 0.81 < draw -> whole measurement fails
+        neighbors = ["n1", "n2", "n3"]
+        node, send_mock, local_keys = self._setup_node_ready_for_bsm(neighbors, success_base=q)
+        with patch.object(node.ghz_protocol, "_random", return_value=draw):
+            node.ghz_protocol._run_bsm_phase(neighbors, local_keys)
+        sent_types = [c.args[1].msg_type for c in send_mock.call_args_list]
+        assert GHZMsgType.GENERATION_FAILED in sent_types
+        assert GHZMsgType.GHZ_RESULT not in sent_types
 
 
 class TestEndToEnd:
