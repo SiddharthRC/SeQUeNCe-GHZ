@@ -159,6 +159,11 @@ class QuantumManagerStabilizer(QuantumManager):
         state_obj = self._initialize_stabilizer_state(state, list(keys))
         for key in keys:
             self.states[key] = state_obj
+            # Seed the idle-time watermark so idling decoherence sees a real
+            # interval for keys registered here: memory qubits enter via set(),
+            # not new(), so without this their idle_sec is always 0. Mirrors the
+            # seeding already done in new(), set_to_zero(), and set_to_one().
+            self.last_idle_time_ps_by_key[key] = 0
 
     # Native SeQUeNCe gate names (lowercase) to the stim instruction names that
     # run_circuit already supports. Native measurements are carried separately
