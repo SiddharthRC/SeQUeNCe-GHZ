@@ -521,10 +521,21 @@ class GHZGenerationA(Protocol):
         block's adjacent Z_i Z_{i+1} parities and applies the unique X-chain
         that restores every parity to +1 (an X on qubit j flips the parities
         adjacent to j; sweeping x[0]=0, x[i+1]=x[i] XOR (parity_i negative)
-        solves it). The remaining global sign is a harmless GHZ Z-frame. The
-        stabiliser parities read here compute a value provably determined by the
-        classical measurement record; this is a simulation-level evaluation of
-        that correction, not information unavailable to the protocol.
+        solves it). The remaining global sign is a harmless GHZ Z-frame.
+        The needed X-chain is provably determined by the classical measurement
+        record (the Bell-pair generation frames plus the BSM outcomes give it
+        with no ambiguity), so this is a correct, deterministic correction
+        rather than a heuristic. It is implemented by reading the assembled
+        stabiliser state as a simulation-level evaluation of that correction.
+
+        Known limitation: because it reads the state, under T1/T2 decoherence
+        the read cannot distinguish the merge-order frame it should fix from a
+        decoherence-induced error it should not, so it interacts with noise. A
+        purely measurement-outcome-based correction (tracking the joint Pauli
+        frame through generation, fusion, and the BSMs, with no state read)
+        would avoid this; it was investigated (Sep 2026) and found correct in
+        principle but to require deeper integration with the stabiliser
+        backend than was practical here, so it is left as future work.
         """
         try:
             qm = self._get_stabilizer_manager()
