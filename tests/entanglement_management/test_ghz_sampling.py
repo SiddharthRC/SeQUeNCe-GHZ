@@ -66,41 +66,47 @@ class SamplingStats:
 def _build_star_topo_config(
     stop_time_ps: int = 10_000_000_000_000,
     seed_offset: int = 0,
+    num_neighbors: int = 3,
 ) -> dict:
-    """Return a 4 node star topology config, one helper and three neighbors.
+    """Return a star topology config: one helper and num_neighbors neighbors.
 
     Args:
         stop_time_ps (int): simulation stop time in picoseconds.
-        seed_offset (int): added to each node''s seed so samples use distinct
+        seed_offset (int): added to each node's seed so samples use distinct
             RNG streams.
+        num_neighbors (int): number of neighbor nodes (helper degree k).
 
     Returns:
         dict: config for RouterNetTopo.
     """
+    neighbors = [f"n{i}" for i in range(1, num_neighbors + 1)]
+    nodes = [
+        {"name": "helper", "type": "QuantumRouter", "seed": seed_offset,
+         "memo_size": num_neighbors},
+    ]
+    for i, nm in enumerate(neighbors, start=1):
+        nodes.append(
+            {"name": nm, "type": "QuantumRouter", "seed": seed_offset + i,
+             "memo_size": 1}
+        )
+    qconnections = [
+        {"node1": "helper", "node2": nm, "attenuation": 0.0,
+         "distance": 500, "type": "meet_in_the_middle"}
+        for nm in neighbors
+    ]
+    cconnections = [
+        {"node1": "helper", "node2": nm, "delay": 500000000} for nm in neighbors
+    ]
+    for i in range(len(neighbors)):
+        for j in range(i + 1, len(neighbors)):
+            cconnections.append(
+                {"node1": neighbors[i], "node2": neighbors[j], "delay": 1000000000}
+            )
     return {
         "stop_time": stop_time_ps,
-        "nodes": [
-            {"name": "helper", "type": "QuantumRouter", "seed": seed_offset, "memo_size": 3},
-            {"name": "n1", "type": "QuantumRouter", "seed": seed_offset + 1, "memo_size": 1},
-            {"name": "n2", "type": "QuantumRouter", "seed": seed_offset + 2, "memo_size": 1},
-            {"name": "n3", "type": "QuantumRouter", "seed": seed_offset + 3, "memo_size": 1},
-        ],
-        "qconnections": [
-            {"node1": "helper", "node2": "n1", "attenuation": 0.0,
-             "distance": 500, "type": "meet_in_the_middle"},
-            {"node1": "helper", "node2": "n2", "attenuation": 0.0,
-             "distance": 500, "type": "meet_in_the_middle"},
-            {"node1": "helper", "node2": "n3", "attenuation": 0.0,
-             "distance": 500, "type": "meet_in_the_middle"},
-        ],
-        "cconnections": [
-            {"node1": "helper", "node2": "n1", "delay": 500000000},
-            {"node1": "helper", "node2": "n2", "delay": 500000000},
-            {"node1": "helper", "node2": "n3", "delay": 500000000},
-            {"node1": "n1", "node2": "n2", "delay": 1000000000},
-            {"node1": "n1", "node2": "n3", "delay": 1000000000},
-            {"node1": "n2", "node2": "n3", "delay": 1000000000},
-        ],
+        "nodes": nodes,
+        "qconnections": qconnections,
+        "cconnections": cconnections,
     }
 
 
@@ -242,6 +248,7 @@ def run_sampling(
     success_base: float = 1.0,
     t1_sec: float = 1.0,
     t2_sec: float = 0.5,
+    num_neighbors: int = 3,
 ) -> SamplingStats:
     """Run num_samples independent attempts and aggregate the results.
 
@@ -257,7 +264,7 @@ def run_sampling(
     """
     results = []
     for i in range(num_samples):
-        config = _build_star_topo_config(seed_offset=i * 10)
+        config = _build_star_topo_config(seed_offset=i * 10, num_neighbors=num_neighbors)
         topo_path = tmp_path / f"star_network_sample_{i}.json"
         topo_path.write_text(json.dumps(config))
 
@@ -364,3 +371,11 @@ class TestGHZSampling:
         for pos in range(3):
             assert not _neighbors_hold_valid_ghz(qm_with_ghz("x", pos), [0, 1, 2])
             assert not _neighbors_hold_valid_ghz(qm_with_ghz("y", pos), [0, 1, 2])
+
+    def test_valid_ghz_at_higher_degree(self, tmp_path):
+        for k in (4, 5):
+            stats = run_sampling(
+                num_samples=25, tmp_path=tmp_path, success_base=1.0, num_neighbors=k
+            )
+            assert stats.ghz_fidelity == 1.0
+            assert all(r.ghz_valid for r in stats.results)
